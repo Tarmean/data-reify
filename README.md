@@ -49,6 +49,7 @@ data FlatExpr = Lambda' Int (Key Expr) | Plus' (Key Expr) (Key Expr) | Var Int |
 instance (MonadRef m) => MuRef Expr m where
     type DeRef Expr = FlatExpr
     mapDeRef visitChildren (Lambda fun) = do
+       -- Trick from the paper: Use the stableName of a function to generate a name for its argument
        uniq <- stableName fun
        let var = Var uniq
        body <- visitChildren (fun var)
