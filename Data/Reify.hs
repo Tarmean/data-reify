@@ -1,151 +1,196 @@
+{-# LANGUAGE CPP, TypeFamilies, RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
 module Data.Reify (
-        MuRef(..),
+        module Data.Reify,
         module Data.Reify.Graph,
-        reifyGraph,
-        reifyGraphs
         ) where
 
-import Control.Concurrent.MVar
+import qualified Data.IntMap as IM
+import qualified Data.Set as S
 
-import qualified Data.HashMap.Lazy as HM
-import Data.HashMap.Lazy (HashMap)
-import Data.Hashable as H
+import System.Mem.StableName ( StableName, hashStableName, makeStableName )
+import Control.Monad.State
+    ( modify,
+      StateT(..),
+      gets,
+      evalStateT )
+
+import Unsafe.Coerce ( unsafeCoerce )
+import Data.Kind (Type)
+import Control.Monad.Writer ( MonadTrans(..), unless, MonadIO(..), WriterT )
+import Control.Monad.Reader ( ReaderT )
+
 import Data.Reify.Graph
-import qualified Data.IntSet as IS
-import Data.IntSet (IntSet)
 
-import System.Mem.StableName
-
-#if !(MIN_VERSION_base(4,7,0))
-import Unsafe.Coerce
-#endif
-
-#if !(MIN_VERSION_base(4,8,0))
-import Control.Applicative
-import Data.Traversable
-#endif
-
--- | 'MuRef' is a class that provided a way to reference into a specific type,
--- and a way to map over the deferenced internals.
-class MuRef a where
-  type DeRef a :: * -> *
-
-  mapDeRef :: (Applicative f) =>
-              (forall b . (MuRef b, DeRef a ~ DeRef b) => b -> f u)
-                        -> a
-                        -> f (DeRef a u)
-
--- | 'reifyGraph' takes a data structure that admits 'MuRef', and returns a 'Graph' that contains
--- the dereferenced nodes, with their children as 'Unique's rather than recursive values.
-reifyGraph :: (MuRef s) => s -> IO (Graph (DeRef s))
-reifyGraph m = do rt1 <- newMVar HM.empty
-                  uVar <- newMVar 0
-                  reifyWithContext rt1 uVar m
-
--- | 'reifyGraphs' takes a 'Traversable' container 't s' of a data structure 's'
--- admitting 'MuRef', and returns a 't (Graph (DeRef s))' with the graph nodes
--- resolved within the same context.
+-- Data.Reify with a different interface.
 --
--- This allows for, e.g., a list of mutually recursive structures.
-reifyGraphs :: (MuRef s, Traversable t) => t s -> IO (t (Graph (DeRef s)))
-reifyGraphs coll = do rt1 <- newMVar HM.empty
-                      uVar <- newMVar 0
-                      traverse (reifyWithContext rt1 uVar) coll
-                        -- NB: We deliberately reuse the same map of stable
-                        -- names and unique supply across all iterations of the
-                        -- traversal to ensure that the same context is used
-                        -- when reifying all elements of the container.
+-- - Call `findNodes` on the values you want to reify, returning keys
+-- - Run the monad stack
+--
+-- You need to manually implement the MonadGlobals type-class, which is responsible for storing your var:=>val bindings.
+--
+-- Usually an instance looks like this:
+--
+-- @
+--
+--     data MyGlobals = MyGlobals
+--       { recExprs :: M.IntMap Expr
+--       , recStatements :: M.IntMap Statement
+--       }
+--     instance Monad m => MonadGlobals (StateT MyGlobals m) Expr where
+--         tellGlobal k v = modify $ \s -> s { recExprs = M.insert k v (recExprs s) }
+--     instance Monad m => MonadGlobals (StateT MyGlobals m) Statement where
+--         tellGlobal k v = modify $ \s -> s { recStatements = M.insert k v (recStatements s) }
+--
+--    type Expr = Expr' Int
+--    type RecExpr = RecExpr (Expr' RecExpr)
+--    instance Applicative f => MuRef RecExpr f where
+--        type DeRef RecExpr = Expr
+--        type Key RecExpr = Int
+--        mapDeRef f (RecExpr a) = case a of
+--           PlusF a b -> Plus <$> f a <*> f b
+--           LambdaF func -> do
+--               var <- stableName func
+--               body <- f (func (Var var))
+--               pure (Lamba var body)
+--           ...
+-- @
+--
+-- 
 
--- Reify a data structure's 'Graph' using the supplied map of stable names and
--- unique supply.
-reifyWithContext :: (MuRef s)
-                 => MVar (HashMap DynStableName Unique)
-                 -> MVar Unique
-                 -> s
-                 -> IO (Graph (DeRef s))
-reifyWithContext rt1 uVar j = do
-  rt2 <- newMVar []
-  nodeSetVar <- newMVar IS.empty
-  root <- findNodes rt1 rt2 uVar nodeSetVar j
-  pairs <- readMVar rt2
-  return (Graph pairs root)
+-- | Core function, traverses the term recursively.
+-- - Substitute all sub-terms with keys
+-- - Add the flattened term to the environment
+findNodes :: forall s m. (MuRef s m, MonadRef m) => s -> m (Key s)
+findNodes !val = do
+    name <- stableName val
+    let k = makeKey @s @m  val name
+    visitOnce name $ do
+        normalized <- mapDeRef findNodes val
+        tellGlobal @s @m k normalized
+    pure k
 
--- The workhorse for 'reifyGraph' and 'reifyGraphs'.
-findNodes :: (MuRef s)
-          => MVar (HashMap DynStableName Unique)
-             -- ^ A map of stable names to unique numbers.
-             --   Invariant: all 'Uniques' that appear in the range are less
-             --   than the current value in the unique name supply.
-          -> MVar [(Unique,DeRef s Unique)]
-             -- ^ The key-value pairs in the 'Graph' that is being built.
-             --   Invariant 1: the domain of this association list is a subset
-             --   of the range of the map of stable names.
-             --   Invariant 2: the domain of this association list will never
-             --   contain duplicate keys.
-          -> MVar Unique
-             -- ^ A supply of unique names.
-          -> MVar IntSet
-             -- ^ The unique numbers that we have encountered so far.
-             --   Invariant: this set is a subset of the range of the map of
-             --   stable names.
-          -> s
-             -- ^ The value for which we will reify a 'Graph'.
-          -> IO Unique
-             -- ^ The unique number for the value above.
-findNodes rt1 rt2 uVar nodeSetVar !j = do
-        st <- makeDynStableName j
-        tab <- takeMVar rt1
-        nodeSet <- takeMVar nodeSetVar
-        case HM.lookup st tab of
-          Just var -> do putMVar rt1 tab
-                         if var `IS.member` nodeSet
-                           then do putMVar nodeSetVar nodeSet
-                                   return var
-                           else recurse var nodeSet
-          Nothing -> do var <- newUnique uVar
-                        putMVar rt1 $ HM.insert st var tab
-                        recurse var nodeSet
-  where
-    recurse :: Unique -> IntSet -> IO Unique
-    recurse var nodeSet = do
-      putMVar nodeSetVar $ IS.insert var nodeSet
-      res <- mapDeRef (findNodes rt1 rt2 uVar nodeSetVar) j
-      tab' <- takeMVar rt2
-      putMVar rt2 $ (var,res) : tab'
-      return var
 
-newUnique :: MVar Unique -> IO Unique
-newUnique var = do
-  v <- takeMVar var
-  let v' = succ v
-  putMVar var v'
-  return v'
+-- | A monad transformer that keeps track of the name=>node pairs.
+class Monad m => MonadGlobals o m where
+    tellGlobal :: Key o -> DeRef o -> m ()
 
--- Stable names that do not use phantom types.
+-- | 'MuRef' is a relative to traverse: We turn pointers with types `a,b,c` into Int-like references `Key a,Key b,Key c`.
+-- This turns our top-level type `s` into `DeRef s`.
+-- 
+-- Usually, the `f` can remain polymorphic. If you want to use your own monad transformer stack, you need to specify the `f` type.
+-- The bottom will always be the `Stable` monad which is responsible for the actual reification.
+class (MonadGlobals a f) => MuRef a f where
+  -- | A flattened representation of the type. In DeRef, pointers to `a` are replaced by `Key a`.
+  type DeRef a :: Type
+  -- | Key represents a reference, usually `Int`
+  type Key a :: Type
+  type Key a = Int
+  makeKey :: a -> Unique -> Key a
+  default makeKey :: (Key a ~ Unique) => a -> Unique -> Key a
+  makeKey _ a = a
+  mapDeRef :: (forall b. (MuRef b f) => b -> f (Key b)) -> a -> f (DeRef a)
+
+runStable :: Stable o -> IO o
+runStable (Stable m) = evalStateT m emptyEnv
+  where emptyEnv = RefEnv { nameMap = StableMap IM.empty, uniqueGen = 0, seen = S.empty }
+
+stableKey :: forall m a. (MuRef a m, MonadRef m) => a -> m (Key a)
+stableKey a = makeKey @_ @m a <$> stableName a
+-- | Internal monad class for name generation and tracking
+-- It's a class so users can lift them through their own monad transformers
+class Monad m => MonadRef m where
+    stableName :: a -> m Unique
+    default stableName :: (MonadTrans t, MonadRef m', m ~ t m') => a -> m Unique
+    stableName = lift . stableName
+    wasVisited :: Unique -> m Bool
+    default wasVisited :: (MonadTrans t, MonadRef m', m ~ t m') => Unique -> m Bool
+    wasVisited = lift . wasVisited
+    markVisited :: Unique -> m ()
+    default markVisited :: (MonadTrans t, MonadRef m', m ~ t m') => Unique -> m ()
+    markVisited = lift . markVisited
+    freshName :: m Unique
+    default freshName :: (MonadTrans t, MonadRef m', m ~ t m') => m Unique
+    freshName = lift freshName
+
+
+instance MonadRef m => MonadRef (StateT s m)
+instance (Monoid s, MonadRef m) => MonadRef (WriterT s m)
+instance (MonadRef m) => MonadRef (ReaderT s m)
+
+newtype Stable a = Stable { unStable :: StateT RefEnv IO a }
+    deriving (Functor, Applicative, Monad, MonadIO)
+data RefEnv = RefEnv { 
+        nameMap ::  StableMap Unique,
+        uniqueGen :: Unique,
+        seen :: S.Set Unique
+    }
+instance MonadRef Stable where
+    freshName = Stable $ do
+        modify $ \s -> s { uniqueGen = uniqueGen s + 1 }
+        gets uniqueGen
+    stableName a = do
+        name <- Stable (makeDynStableName a)
+        mvar <- Stable $ gets (lookupName name . nameMap)
+        case mvar of
+          Just var -> pure var
+          Nothing -> do
+            var <- freshName
+            Stable $ modify $ \s -> s { nameMap = insertStableName  name var (nameMap s) }
+            pure var
+    wasVisited u = Stable $ gets (S.member u . seen)
+    markVisited u = Stable $ modify $ \s -> s { seen = S.insert u (seen s) }
+visitOnce :: MonadRef m => Unique -> m () -> m ()
+visitOnce u m = do
+    visited <- wasVisited u
+    unless visited $ do
+        markVisited u
+        m
+
+-- todo: use a hashmap with builtin probing
+newtype StableMap v = StableMap { unStableMap :: IM.IntMap [(DynStableName,Int)]}
+lookupName :: DynStableName -> StableMap v -> Maybe Int
+lookupName sn (StableMap m) = 
+  case IM.lookup (hashStableName (unDynName sn)) m of
+    Nothing -> Nothing
+    Just xs -> lookup sn xs
+insertStableName :: DynStableName -> Int -> StableMap v -> StableMap v
+insertStableName sn i (StableMap m) = 
+  StableMap $ IM.insertWith (++) (hashStableName (unDynName sn)) [(sn,i)] m
+
+
+-- Stable names that not use phantom types.
 -- As suggested by Ganesh Sittampalam.
--- Note: GHC can't unpack these because of the existential
--- quantification, but there doesn't seem to be much
--- potential to unpack them anyway.
-data DynStableName = forall a. DynStableName !(StableName a)
+newtype DynStableName = DynStableName { unDynName :: StableName ()}
 
-instance Hashable DynStableName where
-  hashWithSalt s (DynStableName n) = hashWithSalt s n
+hashDynStableName :: DynStableName -> Int
+hashDynStableName (DynStableName sn) = hashStableName sn
 
 instance Eq DynStableName where
-  DynStableName m == DynStableName n =
-#if MIN_VERSION_base(4,7,0)
-    eqStableName m n
-#else
-    m == unsafeCoerce n
-#endif
+    (DynStableName sn1) == (DynStableName sn2) = sn1 == sn2
 
-makeDynStableName :: a -> IO DynStableName
+makeDynStableName :: MonadIO m => a -> m DynStableName
 makeDynStableName a = do
-    st <- makeStableName a
-    return $ DynStableName st
+    st <- liftIO (makeStableName a)
+    return $ DynStableName (unsafeCoerce st)
+
+
+newtype ReifyGraphT o m a = ReifyGraphT { unReifyGraphT :: StateT (IM.IntMap o) m a}
+  deriving (Functor, Applicative, Monad, MonadIO, MonadTrans)
+instance MonadRef m => MonadRef (ReifyGraphT o m)
+  
+reifyGraph :: (Key a ~ Int, MuRef a (ReifyGraphT (DeRef a) Stable)) => a -> IO (Graph (DeRef a))
+reifyGraph s = fmap toGraph $ runStable $ runStateT (unReifyGraphT (findNodes s)) IM.empty
+  where
+    toGraph (root, m) = Graph (IM.toList m) root
+instance (Key a ~ Int, o ~ DeRef a, Monad m) => MonadGlobals a (ReifyGraphT o m) where
+    tellGlobal k v = ReifyGraphT $ modify (IM.insert k v)

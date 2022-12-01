@@ -1,4 +1,7 @@
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -23,7 +26,7 @@ spec = parallel $
 data State = State Char [State]
   deriving (Eq, Show)
 
-data StateDeRef r = StateDeRef Char [r]
+data StateDeRef = StateDeRef Char [Unique]
   deriving (Eq, Show)
 
 s1, s2, s3 :: State
@@ -31,11 +34,11 @@ s1 = State 'a' [s2,s3]
 s2 = State 'b' [s1,s2]
 s3 = State 'c' [s2,s1]
 
-instance MuRef State where
+instance MonadGlobals State m => MuRef State m where
   type DeRef State = StateDeRef
   mapDeRef f (State a tr) = StateDeRef a <$> traverse f tr
 
-nubGraph :: Eq (e Unique) => Graph e -> Graph e
+nubGraph :: Eq e => Graph e -> Graph e
 nubGraph (Graph netlist start) = Graph (L.nub netlist) start
 
-deriving instance Eq (e Unique) => Eq (Graph e)
+deriving instance Eq e => Eq (Graph e)
