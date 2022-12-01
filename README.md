@@ -45,7 +45,7 @@ Usage example:
 
 ```Haskell
 data Expr = Lambda (Expr -> Expr) | ...
-data FlatExpr = Lambda' Int Expr | Var Int | ...
+data FlatExpr = Lambda' Int (Key Expr) | Plus' (Key Expr) (Key Expr) | Var Int | ...
 instance (MonadRef m) => MuRef Expr m where
     type DeRef Expr = FlatExpr
     mapDeRef visitChildren (Lambda fun) = do
@@ -53,6 +53,7 @@ instance (MonadRef m) => MuRef Expr m where
        let var = Var uniq
        body <- visitChildren (fun var)
        pure (Lambda' var body)
+    mapDeRef visitChildren (Plus l r) = Plus' <$> visitChildren l <*> visitChildren r
     ...
 
 
