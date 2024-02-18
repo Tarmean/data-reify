@@ -26,7 +26,8 @@ import Control.Monad.State
 
 import Unsafe.Coerce ( unsafeCoerce )
 import Data.Kind (Type)
-import Control.Monad.Writer ( MonadTrans(..), unless, MonadIO(..), WriterT )
+import Control.Monad.Writer ( MonadTrans(..), MonadIO(..), WriterT )
+import Control.Monad (unless)
 import Control.Monad.Reader ( ReaderT )
 
 import Data.Reify.Graph
